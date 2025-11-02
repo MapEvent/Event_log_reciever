@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Receiver — Acoustic Locator</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+:root{--bg:#071018;--card:#0f1b24;--accent:#00c9a7;--muted:#9fb3c8}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,system-ui;background:var(--bg);color:#e6eef6}
+.header{display:flex;gap:8px;align-items:center;padding:10px;background:linear-gradient(90deg,#051018,#0b2430);position:sticky;top:0;z-index:10}
+.header h3{margin:0;font-size:1rem;color:var(--accent)}
+.controls{margin-left:auto;display:flex;gap:8px;align-items:center}
+.input{padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:inherit}
+.btn{padding:8px 10px;border-radius:8px;border:none;cursor:pointer;background:linear-gradient(90deg,var(--accent),#66d9ff);color:#022}
+.container{display:grid;grid-template-columns:1fr 380px;gap:12px;padding:12px}
+@media(max-width:900px){ .container{grid-template-columns:1fr; } .right{order:2} }
+.left{min-height:60vh;background:transparent;border-radius:8px}
+.right{width:100%;max-width:420px}
+.panel{background:var(--card);padding:12px;border-radius:8px}
+#map{height:72vh;border-radius:8px}
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{padding:6px;border-bottom:1px solid rgba(255,255,255,0.03);font-size:13px;color:var(--muted)}
+.small{font-size:12px;color:var(--muted)}
+.event{border-bottom:1px solid rgba(255,255,255,0.03);padding:6px}
+.qr{background:#071522;padding:8px;border-radius:8px;margin-top:8px;word-break:break-all}
+</style>
+</head>
+<body>
+<div class="header">
+  <h3>Receiver — Acoustic Locator</h3>
+  <div class="controls">
+    <input id="wsUrl" class="input" placeholder="ws://192.168.1.10:3000" />
+    <button id="wsConnect" class="btn">WS</button>
+    <button id="createOffer" class="btn">Create Offer</button>
+    <button id="broadcastConfig" class="btn">Broadcast Config</button>
+  </div>
+</div>
+
+<div class="container">
+  <div class="left">
+    <div id="map"></div>
+  </div>
+
+  <div class="right">
+    <div class="panel">
+      <div><strong>Receiver position:</strong> <span id="myPos">—</span></div>
+      <div class="small">Connected detectors</div>
+      <table class="table" id="detTable">
+        <thead><tr><th>ID</th><th>PIN</th><th>Threshold</th><th>MinF</th><th>MaxF</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="small" style="margin-top:8px">Offer (QR or text) — show to detectors for quick pairing</div>
+      <div id="offerBox" class="qr"></div>
+      <div class="small" style="margin-top:8px">Paste Detector Answer(s) below (one per prompt)</div>
+      <div style="margin-top:6px">
+        <button id="pasteAnswer" class="btn" style="background:#1b2b3b">Paste Answer</button>
+      </div>
+      <hr style="border-color:rgba(255,255,255,0.03);margin-top:10px">
+      <div><strong>Events</strong></div>
+      <div id="events" style="max-height:28vh;overflow:auto;margin-top:8px"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// Receiver v2: responsive, QR for offer, multiple RTC peers (one per detector), config broadcast via DC/WS
+const detTableBody = document.querySelector('#detTable tbody');
+const eventsDiv = document.getElementById('events');
+const offerBox = document.getElementById('offerBox');
+const pasteAnswerBtn = document.getElementById('pasteAnswer');
+const broadcastBtn = document.getElementById('broadcastConfig');
+const wsConnectBtn = document.getElementById('wsConnect');
+const wsUrlIn = document.getElementById('wsUrl');
+let map, myLat=null, myLon=null;
+let markers = {};
+let detectors = {}; // id -> {id,pin,threshold,minF,maxF,pc,dc,lastActive}
+let globalWS = null;
+
+// IndexedDB simple store (events)
+const DB_NAME='acoustic_receiver_db', STORE='events', DBVER=1;
+function openDB(){ return new Promise((res,rej)=>{ const rq=indexedDB.open(DB_NAME,DBVER); rq.onupgradeneeded=e=>{ const db=e.target.result; if(!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE,{keyPath:'id',autoIncrement:true}); }; rq.onsuccess=e=>res(e.target.result); rq.onerror=e=>rej(e.target.error); }); }
+async function saveEvent(evt){ const db=await openDB(); const tx=db.transaction(STORE,'readwrite'); tx.objectStore(STORE).add(evt); return new Promise(r=>tx.oncomplete=r); }
+
+// Leaflet init
+map = L.map('map').setView([50,30],5);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OSM'}).addTo(map);
+if(navigator.geolocation){ navigator.geolocation.getCurrentPosition(p=>{ myLat=p.coords.latitude; myLon=p.coords.longitude; document.getElementById('myPos').textContent = `${myLat.toFixed(6)}, ${myLon.toFixed(6)}`; L.circleMarker([myLat,myLon],{radius:8,color:'cyan'}).addTo(map); map.setView([myLat,myLon],12); }, e=> document.getElementById('myPos').textContent='GPS err'); }
+
+function addEventUI(evt){ const el=document.createElement('div'); el.className='event'; el.innerHTML = `<div><strong>${evt.deviceId}</strong> idx:${evt.idx} <span class="small">${new Date(evt.realTs).toISOString()}</span></div><div class="small">lat:${evt.lat?evt.lat.toFixed(6):'-'} lon:${evt.lon?evt.lon.toFixed(6):'-'} avg:${evt.avg?evt.avg.toFixed(1):''}</div>`; eventsDiv.prepend(el); }
+function updateDetectorMarker(id, lat, lon){ if(!lat||!lon) return; if(!markers[id]) markers[id]=L.marker([lat,lon]).addTo(map).bindPopup(id); else markers[id].setLatLng([lat,lon]); if(myLat&&myLon) L.polyline([[myLat,myLon],[lat,lon]],{color:'#ffcc00',weight:2,opacity:0.7}).addTo(map); }
+
+function renderDetectors(){ detTableBody.innerHTML=''; for(const id in detectors){ const d=detectors[id]; const tr=document.createElement('tr'); tr.innerHTML = `<td>${d.id}</td><td>${d.pin||''}</td><td><input data-id="${d.id}" class="thr" value="${d.threshold||160}" style="width:70px"/></td><td><input data-id="${d.id}" class="minf" value="${d.minF||300}" style="width:70px"/></td><td><input data-id="${d.id}" class="maxf" value="${d.maxF||700}" style="width:70px"/></td>`; detTableBody.appendChild(tr); } attachDetTableListeners(); }
+function attachDetTableListeners(){ document.querySelectorAll('.thr').forEach(inp=> inp.addEventListener('change', e=>{ const id=e.target.dataset.id; detectors[id].threshold = Number(e.target.value); sendConfigToDetector(id); })); document.querySelectorAll('.minf').forEach(inp=> inp.addEventListener('change', e=>{ const id=e.target.dataset.id; detectors[id].minF = Number(e.target.value); sendConfigToDetector(id); })); document.querySelectorAll('.maxf').forEach(inp=> inp.addEventListener('change', e=>{ const id=e.target.dataset.id; detectors[id].maxF = Number(e.target.value); sendConfigToDetector(id); })); }
+
+// communication helpers: create PC per detector id
+async function createPCFor(id){
+  const pc = new RTCPeerConnection({ iceServers:[{urls:'stun:stun.l.google.com:19302'}] });
+  pc.onicecandidate = ev=>{ if(ev.candidate && globalWS && globalWS.readyState===1){ globalWS.send(JSON.stringify({type:'ice', to:id, candidate:ev.candidate})); } };
+  pc.onconnectionstatechange = ()=> console.log('PC',id, pc.connectionState);
+  // when remote creates DC (detector as offerer) we capture it
+  pc.ondatachannel = ev=>{
+    const dc = ev.channel;
+    setupDataChannel(id, pc, dc);
+  };
+  detectors[id] = detectors[id] || { id, pin:null, threshold:160, minF:300, maxF:700, pc:null, dc:null, lastActive:Date.now() };
+  detectors[id].pc = pc;
+  return pc;
+}
+
+function setupDataChannel(id, pc, dc){
+  detectors[id].dc = dc;
+  dc.onopen = ()=>{ console.log('DC open', id); detectors[id].lastActive = Date.now(); renderDetectors(); sendConfigToDetector(id); };
+  dc.onmessage = ev=>{
+    try{
+      const m = JSON.parse(ev.data);
+      if(m.type==='trigger' && m.payload){ handleIncoming(m.payload); }
+      else if(m.type==='hello'){ console.log('hello from', id, m); }
+    }catch(e){ console.warn('dc parse', e); }
+  };
+  dc.onclose = ()=>{ console.log('dc close', id); detectors[id].dc = null; renderDetectors(); };
+}
+
+// handle incoming trigger (validate pin)
+async function handleIncoming(payload){
+  if(!payload) return;
+  const pin = payload.pin;
+  const id = payload.deviceId || payload.source || ('det_'+Math.random().toString(36).slice(2,6));
+  // register detector if unknown
+  if(!detectors[id]) addOrUpdateDetector(id, pin);
+  // check pin; only accept if matches stored pin
+  if(detectors[id].pin && detectors[id].pin !== pin){ console.warn('PIN mismatch', id); return; }
+  // update last active
+  detectors[id].lastActive = Date.now();
+  // save and render
+  const evt = { deviceId:id, idx:payload.idx||1, realTs: payload.realTs||Date.now(), lat: payload.lat, lon: payload.lon, avg: payload.avg||0 };
+  await saveEvent(evt);
+  addEventUI(evt);
+  updateDetectorMarker(id, evt.lat, evt.lon);
+  renderDetectors();
+  attemptLocalization();
+}
+
+// add/update detector record (from first contact)
+function addOrUpdateDetector(id, pin){
+  detectors[id] = detectors[id] || { id, pin, threshold:160, minF:300, maxF:700, pc:null, dc:null, lastActive:Date.now() };
+  detectors[id].pin = pin;
+  renderDetectors();
+}
+
+// send config object to a detector (via DC if available, otherwise via WS broadcast)
+function sendConfigToDetector(id){
+  const d = detectors[id];
+  const msg = { type:'config', threshold: d.threshold, minF: d.minF, maxF: d.maxF };
+  if(d.dc && d.dc.readyState==='open'){ d.dc.send(JSON.stringify(msg)); console.log('sent config to', id); }
+  else if(globalWS && globalWS.readyState===1){ globalWS.send(JSON.stringify({ type:'config-broadcast', target:id, payload: msg })); console.log('ws broadcast config to', id); }
+}
+
+// broadcast to all detectors
+function broadcastConfigAll(){
+  for(const id in detectors) sendConfigToDetector(id);
+  alert('Config broadcast attempted to ' + Object.keys(detectors).length + ' detectors');
+}
+
+// Offer creation + QR generation
+async function createOfferAndShow(){
+  // create a "listener" pc where receiver is offerer and will accept detector answers.
+  // For each detector we will create a fresh pc when answer arrives; here we create a template offer object to share via QR.
+  const pc = new RTCPeerConnection({ iceServers:[{urls:'stun:stun.l.google.com:19302'}] });
+  // create data channel on this pc so detectors can open DC
+  const dc = pc.createDataChannel('data');
+  dc.onopen = ()=> console.log('offer-channel open');
+  dc.onmessage = ev=> console.log('msg', ev.data);
+  pc.onicecandidate = ()=>{};
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  // show offer sdp as text and QR (base64 small)
+  const offerObj = { sdp: pc.localDescription, note:'paste answer back to receiver' };
+  const txt = JSON.stringify(offerObj);
+  offerBox.textContent = txt;
+  // create QR via data URI using Google Chart fallback-free approach: we'll generate simple QR via canvas and third-party-free?
+  // Use a minimal inline QR generator (tinyqrcode) - but offline: create simple SVG QR using jsQR? To keep offline-safe, show base64 text and let user copy.
+  // For convenience, also show a short base64 string to copy
+  const b64 = btoa(unescape(encodeURIComponent(txt)));
+  const short = b64.slice(0,400); // truncated
+  const pre = document.createElement('pre'); pre.style.whiteSpace='pre-wrap'; pre.style.maxHeight='120px'; pre.style.overflow='auto'; pre.textContent = 'Offer (paste to detector):\\n' + txt; offerBox.innerHTML=''; offerBox.appendChild(pre);
+  // For practical QR scanning offline, we provide the offer as text to copy or user can screenshot to share.
+  window._currentOffer = offerObj;
+  alert('Offer created. Share the offer text with detectors (QR generation limited offline).');
+}
+
+// paste detector answer (manual)
+pasteAnswerBtn.addEventListener('click', async ()=>{
+  const txt = prompt('Paste detector answer JSON here (cancel to stop):');
+  if(!txt) return;
+  try{
+    const obj = JSON.parse(txt);
+    if(!obj.sdp){ alert('Invalid answer'); return; }
+    // create a new PC for this detector, set remote description
+    const idGuess = obj.from || ('det_'+Math.random().toString(36).slice(2,6));
+    const pc = await createPCFor(idGuess);
+    await pc.setRemoteDescription(new RTCSessionDescription(obj.sdp));
+    // when dc opens, it'll register and detector will send hello/first payload
+    alert('Answer applied. DataChannel should open when detector connects.');
+  }catch(e){ alert('Invalid JSON: '+e); }
+});
+
+// broadcast button
+broadcastBtn.addEventListener('click', ()=> broadcastConfigAll());
+
+// ws connect (optional relay)
+wsConnectBtn.addEventListener('click', ()=>{
+  const u = wsUrlIn.value.trim(); if(!u) return alert('Enter ws url');
+  try{ globalWS = new WebSocket(u); } catch(e){ return alert('WS error'); }
+  globalWS.onopen = ()=> console.log('WS open'); globalWS.onmessage = ev=>{ try{ const m = JSON.parse(ev.data); if(m.type==='trigger-broadcast' && m.payload) handleIncoming(m.payload); else if(m.type==='config-ack') console.log('cfg ack', m); else if(m.type==='ice' && m.from){ // relay candidate from detector - find pc and add candidate
+      const pc = detectors[m.from] && detectors[m.from].pc; if(pc) pc.addIceCandidate(m.candidate).catch(()=>{});
+    } }catch(e){} };
+  globalWS.onclose = ()=> console.log('WS closed');
+  window.globalWS = globalWS;
+});
+
+// localization attempt (same logic as before)
+async function attemptLocalization(){ const db = await openDB(); const all=[]; await new Promise(res=>{ const tx=db.transaction(STORE,'readonly'); const cur=tx.objectStore(STORE).openCursor(); cur.onsuccess = e=>{ const c=e.target.result; if(!c){ res(); return; } all.push(c.value); c.continue(); }; }); const now=Date.now(); const recent = all.filter(a=>Math.abs(now - a.realTs) < 1500); if(recent.length<3) return; // simple grouping and estimate similar to previous implementation
+  recent.sort((a,b)=>a.realTs - b.realTs); const groups=[]; for(const r of recent){ let placed=false; for(const g of groups){ if(Math.abs(r.realTs - g.tavg) < 120){ g.items.push(r); g.tavg = (g.tavg*(g.items.length-1) + r.realTs)/g.items.length; placed=true; break; } } if(!placed) groups.push({ items:[r], tavg:r.realTs }); } for(const g of groups){ const withCoords = g.items.filter(x=>x.lat && x.lon); if(withCoords.length>=3){ const est = estimateSource(withCoords); if(est){ if(window.estMarker) map.removeLayer(window.estMarker); window.estMarker = L.circleMarker([est.lat, est.lon], { radius:8, color:'red' }).addTo(map).bindPopup('Estimated source'); map.setView([est.lat, est.lon], 14); await saveEvent({ deviceId:'estimator', idx:0, realTimeISO:new Date().toISOString(), realTs:Date.now(), lat:est.lat, lon:est.lon, avg:0 }); } break; } } }
+
+// estimateSource - same math as before
+function estimateSource(items){ if(!myLat||!myLon) return null; if(items.length<3) return null; items.sort((a,b)=>a.realTs - b.realTs); const ref=items[0]; const R=6378137; function latlonToXY(lat,lon){ const dLat=(lat - myLat)*Math.PI/180; const dLon=(lon - myLon)*Math.PI/180; const x = R * dLon * Math.cos(myLat * Math.PI/180); const y = R * dLat; return [x,y]; } const c=343.0; const p0 = latlonToXY(ref.lat, ref.lon); const A=[]; const b=[]; for(let i=1;i<items.length;i++){ const ei=items[i]; const pi = latlonToXY(ei.lat, ei.lon); const dx = pi[0]-p0[0], dy = pi[1]-p0[1]; const dt = (ei.realTs - ref.realTs)/1000; const rhs = 0.5*( (pi[0]*pi[0]+pi[1]*pi[1]) - (p0[0]*p0[0]+p0[1]*p0[1]) - (c*dt)*(c*dt) ); A.push([dx,dy]); b.push(rhs); } const AtA=[[0,0],[0,0]]; const Atb=[0,0]; for(let i=0;i<A.length;i++){ const a=A[i]; AtA[0][0]+=a[0]*a[0]; AtA[0][1]+=a[0]*a[1]; AtA[1][0]+=a[1]*a[0]; AtA[1][1]+=a[1]*a[1]; Atb[0]+=a[0]*b[i]; Atb[1]+=a[1]*b[i]; } const det = AtA[0][0]*AtA[1][1] - AtA[0][1]*AtA[1][0]; if(Math.abs(det) < 1e-6) return null; const inv = [[AtA[1][1]/det, -AtA[0][1]/det], [-AtA[1][0]/det, AtA[0][0]/det]]; const px = inv[0][0]*Atb[0] + inv[0][1]*Atb[1]; const py = inv[1][0]*Atb[0] + inv[1][1]*Atb[1]; const dLat = py / R; const dLon = px / (R * Math.cos(myLat * Math.PI / 180)); const lat = myLat + dLat * 180/Math.PI; const lon = myLon + dLon * 180/Math.PI; return { lat, lon }; }
+
+// saveEvent wrapper for receiver DB
+async function saveEvent(evt){ const db = await openDB(); const tx = db.transaction(STORE,'readwrite'); tx.objectStore(STORE).add(evt); return new Promise(r=>tx.oncomplete=r); }
+
+// initialization
+renderDetectors();
+
+</script>
+</body>
+</html>

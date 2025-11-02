@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Detector — Acoustic Locator (QR & Config)</title>
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+:root{--bg:#071018;--card:#0f1b24;--accent:#00c9a7;--muted:#9fb3c8}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui;background:var(--bg);color:#e6eef6}
+.container{max-width:980px;margin:14px auto;padding:12px}
+.card{background:var(--card);padding:12px;border-radius:10px}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+label{color:var(--muted);font-size:14px}
+input,button,textarea{font:inherit}
+input[type=number],input[type=range],input[type=text]{padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:inherit}
+button{padding:8px 12px;border-radius:8px;border:none;cursor:pointer}
+.btnPrimary{background:linear-gradient(90deg,var(--accent),#66d9ff);color:#022}
+canvas{width:100%;height:200px;border-radius:8px;background:#0004;margin-top:8px}
+.small{font-size:13px;color:var(--muted)}
+.videoWrap{margin-top:8px;background:#071522;padding:8px;border-radius:8px}
+</style>
+</head>
+<body>
+<div class="container">
+  <h2>Detector — Acoustic Locator</h2>
+  <div class="card">
+    <div class="row">
+      <label>Мин. Гц<input id="minFreq" type="number" value="300" min="20" max="20000"></label>
+      <label>Макс. Гц<input id="maxFreq" type="number" value="700" min="20" max="20000"></label>
+      <label>Чувств<input id="sensitivity" type="range" min="50" max="255" value="160"><span id="sensVal" class="small">160</span></label>
+    </div>
+
+    <div style="margin-top:8px" class="row">
+      <label>Signaling (optional, ws://ip:port)<input id="signalingUrl" type="text" placeholder="ws://192.168.1.10:3000"></label>
+      <label>Receiver ID (optional)<input id="receiverId" type="text" placeholder="receiver-id"></label>
+    </div>
+
+    <div style="margin-top:8px" class="row">
+      <button id="startBtn" class="btnPrimary">Start (autostart attempt)</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <button id="scanQrBtn">Scan Offer (QR)</button>
+    </div>
+
+    <div id="status" class="small" style="margin-top:8px">Status: ready</div>
+    <div style="margin-top:8px" class="small">Your device PIN: <strong id="devicePin">—</strong></div>
+
+    <canvas id="spectrum"></canvas>
+
+    <div style="margin-top:8px" class="row">
+      <div class="small" id="coords">GPS: —</div>
+      <div class="small" id="sync">Sync: not synced</div>
+      <div class="small" id="channel">Channel: none</div>
+    </div>
+
+    <div class="videoWrap" id="videoWrap" style="display:none">
+      <div class="small">QR Scanner (camera)</div>
+      <video id="video" autoplay playsinline style="width:100%;border-radius:6px"></video>
+      <div style="margin-top:6px"><button id="stopScan">Stop Scan</button></div>
+    </div>
+
+    <div style="margin-top:10px">
+      <div class="small">Logs (latest)</div>
+      <div id="logs"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Detector v2: supports scanning Offer via BarcodeDetector API (if available), and accepts config messages via DC/WS
+(function(){
+  const clientId = 'D_' + Math.random().toString(36).slice(2,9);
+  const DEVICE_PIN_KEY = 'acoustic_detector_pin';
+  let devicePin = localStorage.getItem(DEVICE_PIN_KEY);
+  if(!devicePin){ devicePin = Math.floor(100000 + Math.random()*900000).toString(); localStorage.setItem(DEVICE_PIN_KEY, devicePin); }
+  document.getElementById('devicePin').textContent = devicePin;
+
+  // UI elements
+  const startBtn = document.getElementById('startBtn'), stopBtn = document.getElementById('stopBtn'), scanQrBtn = document.getElementById('scanQrBtn');
+  const statusEl = document.getElementById('status'), coordsEl = document.getElementById('coords'), channelEl = document.getElementById('channel');
+  const logsEl = document.getElementById('logs');
+  const videoWrap = document.getElementById('videoWrap'), videoEl = document.getElementById('video'), stopScanBtn = document.getElementById('stopScan');
+
+  let pc=null, dc=null, ws=null;
+  let audioCtx, analyser, bufferLength, dataArray, source, stream, rafId;
+  let gps={lat:null,lon:null,acc:null}, triggered=false;
+  let threshold = Number(document.getElementById('sensitivity').value);
+  const DB_NAME='acoustic_detector_db', STORE='events', dbVersion=1;
+
+  // apply remote config
+  function applyConfig(msg){ if(msg.threshold) document.getElementById('sensitivity').value = msg.threshold; if(msg.minF) document.getElementById('minFreq').value = msg.minF; if(msg.maxF) document.getElementById('maxFreq').value = msg.maxF; threshold = Number(document.getElementById('sensitivity').value); log('Applied config: '+JSON.stringify(msg)); }
+
+  // setup data channel handlers for receiving config
+  function setupDCHandlers(ch){
+    dc = ch;
+    dc.onopen = ()=>{ channelEl.textContent = 'Channel: DataChannel (open)'; log('DC open'); };
+    dc.onmessage = ev=>{ try{ const m = JSON.parse(ev.data); if(m.type==='config'){ applyConfig(m); } else if(m.type==='ping'){ dc.send(JSON.stringify({type:'pong', from:clientId})); } }catch(e){ } };
+    dc.onclose = ()=>{ channelEl.textContent='Channel: closed'; log('DC closed'); dc=null; };
+  }
+
+  // BarcodeDetector-based QR scanning
+  let scannerStream = null;
+  async function startQRScanner(){
+    if(!('BarcodeDetector' in window) && !navigator.mediaDevices){ alert('QR scanning not supported in this browser. Use manual paste.'); return; }
+    try{
+      scannerStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      videoEl.srcObject = scannerStream;
+      videoWrap.style.display = 'block';
+      if('BarcodeDetector' in window){
+        const detector = new BarcodeDetector({formats: ['qr_code']});
+        const scanLoop = async ()=>{
+          try{
+            const bitmap = await detector.detect(videoEl);
+            if(bitmap && bitmap.length){
+              const txt = bitmap[0].rawValue;
+              stopQRScanner();
+              handleOfferText(txt);
+              return;
+            }
+          }catch(e){};
+          if(scannerStream) requestAnimationFrame(scanLoop);
+        };
+        scanLoop();
+      } else {
+        // fallback: capture frames and try third-party? we'll prompt manual copy if unavailable
+        alert('BarcodeDetector not available — please paste Offer text instead.');
+      }
+    }catch(e){ alert('Camera start failed: '+e.message); }
+  }
+  function stopQRScanner(){ if(scannerStream){ scannerStream.getTracks().forEach(t=>t.stop()); scannerStream=null; } videoWrap.style.display='none'; }
+
+  stopScanBtn.addEventListener('click', ()=> stopQRScanner());
+  scanQrBtn.addEventListener('click', ()=> startQRScanner());
+
+  // handle offer JSON text (from receiver)
+  async function handleOfferText(txt){
+    let obj=null;
+    try{ obj = JSON.parse(txt); }catch(e){ alert('Invalid offer text'); return; }
+    // assume obj.sdp present
+    await createPeerAndAnswer(obj);
+  }
+
+  async function createPeerAndAnswer(offerObj){
+    pc = new RTCPeerConnection({ iceServers:[{urls:'stun:stun.l.google.com:19302'}] });
+    pc.onicecandidate = ev=>{ /* could send candidate via WS if configured */ };
+    pc.ondatachannel = ev=>{ setupDCHandlers(ev.channel); };
+    await pc.setRemoteDescription(new RTCSessionDescription(offerObj.sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    // present answer JSON for copying back to receiver (user must paste into Receiver)
+    const out = JSON.stringify({ sdp: pc.localDescription, from: clientId });
+    try{ await navigator.clipboard.writeText(out); alert('Answer copied to clipboard. Paste it into Receiver.'); }catch(e){ prompt('Copy this answer and paste to Receiver:', out); }
+  }
+
+  // IndexedDB helpers (same as before)
+  function openDB(){ return new Promise((res,rej)=>{ const r=indexedDB.open(DB_NAME, dbVersion); r.onupgradeneeded=e=>{ const db=e.target.result; if(!db.objectStoreNames.contains(STORE)){ const st=db.createObjectStore(STORE,{keyPath:'id',autoIncrement:true}); st.createIndex('sent','sent',{unique:false}); } }; r.onsuccess = e=> res(e.target.result); r.onerror = e=> rej(e.target.error); }); }
+  async function addEvent(evt){ const db=await openDB(); const tx=db.transaction(STORE,'readwrite'); tx.objectStore(STORE).add(evt); return new Promise(r=>tx.oncomplete=r); }
+  async function getPending(){ const db=await openDB(); return new Promise((res)=>{ const out=[]; const tx=db.transaction(STORE,'readonly'); const cur=tx.objectStore(STORE).openCursor(); cur.onsuccess = e=>{ const c=e.target.result; if(!c){ res(out); return; } if(!c.value.sent) out.push(c.value); c.continue(); }; }); }
+  async function markSent(id){ const db=await openDB(); const tx=db.transaction(STORE,'readwrite'); const st=tx.objectStore(STORE); const req=st.get(id); req.onsuccess = e=>{ const v=e.target.result; if(v){ v.sent=true; v.sentAt=Date.now(); st.put(v); } }; return new Promise(r=>tx.oncomplete=r); }
+
+  // audio detection
+  async function startAudio(){
+    stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    source = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.7;
+    bufferLength = analyser.frequencyBinCount; dataArray = new Uint8Array(bufferLength);
+    source.connect(analyser);
+    statusEl.textContent = 'Status: mic active';
+    drawLoop();
+  }
+  function stopAudio(){ if(rafId) cancelAnimationFrame(rafId); if(audioCtx) try{ audioCtx.close(); }catch(e){} if(stream) stream.getTracks().forEach(t=>t.stop()); statusEl.textContent='Status: stopped'; }
+
+  function drawLoop(){ rafId=requestAnimationFrame(drawLoop); analyser.getByteFrequencyData(dataArray); const sr=(audioCtx&&audioCtx.sampleRate)||48000; const nyq=sr/2; const minF = Math.max(20, Number(document.getElementById('minFreq').value) || 300); const maxF = Math.min(nyq, Number(document.getElementById('maxFreq').value)||700); const minIndex = Math.floor((minF/nyq)*bufferLength); const maxIndex = Math.floor((maxF/nyq)*bufferLength); let sum=0,count=0; for(let i=minIndex;i<=maxIndex;i++){ sum+=dataArray[i]; count++; } const avg = count? (sum/count):0; statusEl.textContent = 'Status: listening, avg=' + avg.toFixed(1); if(avg > Number(document.getElementById('sensitivity').value)){ if(!triggered){ triggered=true; const nowPerf=performance.now(); const nowSys=Date.now(); const rec = { deviceId: clientId, pin: devicePin, realTime:new Date(nowSys).toISOString(), realTs: nowSys, perfNow: nowPerf, lat: gps.lat, lon: gps.lon, avg }; await addEvent(rec); // try to send via dc or ws if open if(dc && dc.readyState==='open'){ dc.send(JSON.stringify({type:'trigger', payload:rec})); await markSent(rec.id); } else if(ws && ws.readyState===1){ ws.send(JSON.stringify({type:'trigger', payload:rec})); await markSent(rec.id); } } } else triggered=false; }
+
+  // gps watch
+  if(navigator.geolocation){ navigator.geolocation.watchPosition(p=>{ gps.lat=p.coords.latitude; gps.lon=p.coords.longitude; gps.acc=p.coords.accuracy; coordsEl.textContent = `GPS: ${gps.lat.toFixed(6)}, ${gps.lon.toFixed(6)} (±${gps.acc}m)`; }, err=> coordsEl.textContent = 'GPS error: '+err.message, { enableHighAccuracy:true, maximumAge:1000 }); } else coordsEl.textContent='GPS not available';
+
+  // UI
+  startBtn.addEventListener('click', async ()=>{ try{ await startAudio(); startBtn.disabled=true; stopBtn.disabled=false; }catch(e){ alert('Cannot start audio: '+e.message); } });
+  stopBtn.addEventListener('click', ()=>{ stopAudio(); startBtn.disabled=false; stopBtn.disabled=true; });
+
+  // manual paste handler: if user pastes answer from receiver, we set remote description
+  window.addEventListener('message', async (ev)=>{ try{ const obj = ev.data; if(obj && obj.type==='applyAnswer'){ if(obj.sdp){ if(!pc) pc = new RTCPeerConnection({ iceServers:[{urls:'stun:stun.l.google.com:19302'}] }); pc.ondatachannel = e=> setupDCHandlers(e.channel); await pc.setRemoteDescription(new RTCSessionDescription(obj.sdp)); const ans = await pc.createAnswer(); await pc.setLocalDescription(ans); // send answer back via clipboard/prompt (for manual) const out = JSON.stringify({ sdp: pc.localDescription, from: clientId }); try{ await navigator.clipboard.writeText(out); alert('Answer copied to clipboard'); }catch(e){ prompt('Copy this answer to receiver:', out); } } } }catch(e){} });
+
+  // simple log helper
+  function log(m){ const d=document.createElement('div'); d.textContent = new Date().toISOString() + ' ' + m; logsEl.prepend(d); }
+
+})(); // end IIFE
+</script>
+</body>
+</html>
